@@ -5,12 +5,15 @@ const Writer = std.io.Writer;
 
 /// Parse a line ending in "\r\n", consuming them
 fn readLineCRLF(reader: *Reader, scratch: []u8) ![]u8 {
+    @memset(scratch, 0);
     var writer: Writer = .fixed(scratch);
 
     const n = try Reader.streamDelimiter(reader, &writer, '\n');
     // NOTE: `toss` the remaining `\n`
     reader.toss(1);
-    if (scratch[n - 1] != '\r') {
+    if (n == 0 or scratch[n - 1] != '\r') {
+        std.debug.print("scratch: {s}\n", .{scratch});
+
         return error.NoCarriageReturn;
     }
 
@@ -26,7 +29,10 @@ fn readLineCRLF(reader: *Reader, scratch: []u8) ![]u8 {
 fn readExactCRLF(reader: *Reader) !void {
     var crlf = std.mem.zeroes([2]u8);
     const n = try reader.readSliceShort(&crlf);
-    if (n != 2 or !std.mem.eql(u8, &crlf, "\r\n")) return error.BadCRLF;
+    if (n != 2 or !std.mem.eql(u8, &crlf, "\r\n")) {
+        std.debug.print("CRLF: {d} {d}, instead of {d} {d}", .{ crlf[0], crlf[1], '\r', '\n' });
+        return error.BadCRLF;
+    }
 }
 
 fn readNBytesAlloc(reader: *Reader, allocator: std.mem.Allocator, n: usize) ![]u8 {
@@ -59,7 +65,7 @@ pub fn readRespCommand(reader: *Reader, allocator: std.mem.Allocator) !struct {
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    // WARN: parent `allocator` owns the list 
+    // WARN: parent `allocator` owns the list
     var parts: std.ArrayList([]u8) = try .initCapacity(allocator, count);
 
     // NOTE: 2) For each element: expect a bulk string:
@@ -68,6 +74,8 @@ pub fn readRespCommand(reader: *Reader, allocator: std.mem.Allocator) !struct {
     while (i < count) : (i += 1) {
         const typeline = try readLineCRLF(reader, &line_buf);
         if (typeline.len == 0) return error.BadFrame;
+
+        std.debug.print("Typeline: {s}\n", .{typeline});
 
         switch (typeline[0]) {
             // Bulk string
@@ -87,7 +95,7 @@ pub fn readRespCommand(reader: *Reader, allocator: std.mem.Allocator) !struct {
     }
 
     return .{
-        .argv = try parts.toOwnedSlice(a),
+        .argv = try parts.toOwnedSlice(allocator),
         .arena = arena,
     };
 }
@@ -95,7 +103,7 @@ pub fn readRespCommand(reader: *Reader, allocator: std.mem.Allocator) !struct {
 const stdout = std.fs.File.stdout();
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() == .ok);
+    // defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
     try stdout.writeAll("Logs from your program will appear here!\n");
@@ -122,16 +130,25 @@ pub fn main() !void {
         var stream_writer: net.Stream.Writer = connection.stream.writer(&output_buff);
         const writer: *Writer = &stream_writer.interface;
 
-        const cmd = try readRespCommand(reader, alloc);
-        defer cmd.arena.deinit();
-        defer alloc.free(cmd.argv);
+        while (true) {
+            const cmd = readRespCommand(reader, alloc) catch |err| switch (err) {
+                // NOTE: connection closed (expectedly), exit the per-connection loop
+                error.EndOfStream,
+                => {
+                    break;
+                },
+                else => return err,
+            };
+            defer cmd.arena.deinit();
+            defer alloc.free(cmd.argv);
 
-        for (cmd.argv, 0..) |arg, idx| {
-            std.debug.print("{d}: {s}\n", .{ idx, arg });
-            if (std.mem.eql(u8, arg, "PING")) {
-                _ = try writer.write("+PONG\r\n");
+            for (cmd.argv, 0..) |arg, idx| {
+                std.debug.print("{d}: {s}\n", .{ idx, arg });
+                if (std.mem.eql(u8, arg, "PING")) {
+                    _ = try writer.write("+PONG\r\n");
+                }
+                try writer.flush();
             }
-            try writer.flush();
         }
     }
 }
