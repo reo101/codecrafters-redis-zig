@@ -2,12 +2,15 @@ const std = @import("std");
 
 // Learn more about this file here: https://ziglang.org/learn/build-system
 pub fn build(b: *std.Build) void {
+
+    const root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = b.graph.host,
+    });
+
     const exe = b.addExecutable(.{
         .name = "main",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = b.graph.host,
-        }),
+        .root_module = root_module,
     });
 
     // This declares intent for the executable to be installed into the
