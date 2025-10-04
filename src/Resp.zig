@@ -1,5 +1,6 @@
 const std = @import("std");
 const net = std.net;
+const Connection = net.Server.Connection;
 const io = std.io;
 
 const log = std.log.scoped(.RespCommand);
@@ -125,4 +126,23 @@ pub fn handleConnection(reader: *io.Reader, writer: *io.Writer, allocator: std.m
             try writer.flush();
         }
     }
+}
+
+pub fn connectionWorker(conn: Connection) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+
+    var in_buf:  [1<<12]u8 = undefined;
+    var out_buf: [1<<12]u8 = undefined;
+
+    defer conn.stream.close();
+
+    var stream_reader = conn.stream.reader(&in_buf);
+    const reader: *io.Reader = stream_reader.interface();
+
+    var stream_writer = conn.stream.writer(&out_buf);
+    const writer: *io.Writer = &stream_writer.interface;
+
+    try handleConnection(reader, writer, allocator);
 }

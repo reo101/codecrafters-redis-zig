@@ -7,10 +7,6 @@ const io = std.io;
 const log = std.log.scoped(.main);
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() == .ok);
-    const allocator = gpa.allocator();
-
     log.info("Program started", .{});
 
     const port: u16 = 6379;
@@ -24,21 +20,12 @@ pub fn main() !void {
 
     log.info("Listening at port {d}", .{port});
 
-    var input_buff = std.mem.zeroes([128]u8);
-    var output_buff = std.mem.zeroes([128]u8);
-
     while (true) {
         const connection = try listener.accept();
-        defer connection.stream.close();
-
         log.info("Accepted new connection", .{});
 
-        var stream_reader: net.Stream.Reader = connection.stream.reader(&input_buff);
-        const reader: *io.Reader = stream_reader.interface();
+        var thread = try std.Thread.spawn(.{}, Resp.connectionWorker, .{connection});
 
-        var stream_writer: net.Stream.Writer = connection.stream.writer(&output_buff);
-        const writer: *io.Writer = &stream_writer.interface;
-
-        try Resp.handleConnection(reader, writer, allocator);
+        thread.detach();
     }
 }
