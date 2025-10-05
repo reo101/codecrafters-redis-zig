@@ -104,6 +104,11 @@ pub fn readOneCommand(reader: *io.Reader, allocator: std.mem.Allocator) !struct 
     };
 }
 
+pub fn writeString(writer: *io.Writer, string: []const u8) !void {
+    try writer.print("${d}\r\n{s}\r\n", .{ string.len, string });
+    try writer.flush();
+}
+
 pub fn handleConnection(reader: *io.Reader, writer: *io.Writer, allocator: std.mem.Allocator) !void {
     while (true) {
         const cmd = readOneCommand(reader, allocator) catch |err| switch (err) {
@@ -119,11 +124,13 @@ pub fn handleConnection(reader: *io.Reader, writer: *io.Writer, allocator: std.m
 
         for (cmd.argv, 0..) |arg, idx| {
             log.debug("{d}: {s}", .{ idx, arg });
+        }
 
-            if (std.mem.eql(u8, arg, "PING")) {
-                _ = try writer.write("+PONG\r\n");
-            }
+        if (std.mem.eql(u8, cmd.argv[0], "PING")) {
+            _ = try writer.write("+PONG\r\n");
             try writer.flush();
+        } else if (std.mem.eql(u8, cmd.argv[0], "ECHO")) {
+            _ = try writeString(writer, cmd.argv[1]);
         }
     }
 }
@@ -133,8 +140,8 @@ pub fn connectionWorker(conn: Connection) !void {
     defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();
 
-    var in_buf:  [1<<12]u8 = undefined;
-    var out_buf: [1<<12]u8 = undefined;
+    var in_buf: [1 << 12]u8 = undefined;
+    var out_buf: [1 << 12]u8 = undefined;
 
     defer conn.stream.close();
 
