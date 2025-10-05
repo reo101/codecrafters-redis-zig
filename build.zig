@@ -2,16 +2,26 @@ const std = @import("std");
 
 // Learn more about this file here: https://ziglang.org/learn/build-system
 pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
-        .target = b.graph.host,
+        .target = target,
     });
+
+    const xev = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    root_module.addImport("xev", xev.module("xev"));
 
     const exe = b.addExecutable(.{
         .name = "main",
         .root_module = root_module,
     });
+
+    exe.linkLibC();
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default

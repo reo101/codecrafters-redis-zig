@@ -1,171 +1,143 @@
 const std = @import("std");
 const net = std.net;
-const Connection = net.Server.Connection;
 const io = std.io;
 
-const log = std.log.scoped(.RespCommand);
+const Server = @import("./Server.zig");
 
-/// Parse a line ending in "\r\n", consuming them
-fn readLineCRLF(reader: *io.Reader, scratch: []u8) ![]u8 {
-    @memset(scratch, 0);
-    var writer: io.Writer = .fixed(scratch);
+const log = std.log.scoped(.Resp);
 
-    const n = try io.Reader.streamDelimiter(reader, &writer, '\n');
-    // NOTE: `toss` the remaining `\n`
-    reader.toss(1);
-    if (n == 0 or scratch[n - 1] != '\r') {
-        log.err("scratch: {s}", .{scratch});
-
-        return error.NoCarriageReturn;
-    }
-
-    const line = scratch[0 .. n - 1];
-    if (line.len == 0) {
-        return error.EmptyCommand;
-    }
-
-    return line;
-}
-
-/// Read exactly "\r\n", used when we've exactly read all data before that
-fn readExactCRLF(reader: *io.Reader) !void {
-    var crlf = std.mem.zeroes([2]u8);
-    const n = try reader.readSliceShort(&crlf);
-    if (n != 2 or !std.mem.eql(u8, &crlf, "\r\n")) {
-        log.err("CRLF: {d} {d}, instead of {d} {d}", .{ crlf[0], crlf[1], '\r', '\n' });
-        return error.BadCRLF;
+pub fn writeBulkInto(buf: []u8, string_opt: ?[]const u8) []const u8 {
+    if (string_opt) |string| {
+        const header = std.fmt.bufPrint(buf, "${d}\r\n", .{string.len}) catch unreachable;
+        var i: usize = header.len;
+        std.mem.copyForwards(u8, buf[i .. i + string.len], string);
+        i += string.len;
+        buf[i] = '\r';
+        buf[i + 1] = '\n';
+        i += 2;
+        return buf[0..i];
+    } else {
+        const nil = "$-1\r\n";
+        std.mem.copyForwards(u8, buf[0..nil.len], nil);
+        return buf[0..nil.len];
     }
 }
 
-fn readNBytesAlloc(reader: *io.Reader, allocator: std.mem.Allocator, n: usize) ![]u8 {
-    var buf = try allocator.alloc(u8, n);
-    var filled: usize = 0;
-    while (filled < n) {
-        const got = try reader.readSliceShort(buf[filled..]);
-        if (got == 0) return error.UnexpectedEof;
-        filled += got;
+pub const FmtArgv = struct {
+    argv: []const []const u8,
+    pub fn format(self: @This(), writer: anytype) !void {
+        try writer.writeByte('[');
+        for (self.argv, 0..) |arg, i| {
+            if (i != 0) try writer.writeAll(", ");
+            try writer.print("\"{s}\"", .{arg});
+        }
+        try writer.writeByte(']');
     }
-    return buf;
-}
+};
 
-/// Parse a single RESP array of bulk strings: "*N\r\n$<len>\r\n<bytes>\r\n"
-pub fn readOneCommand(reader: *io.Reader, allocator: std.mem.Allocator) !struct {
-    /// Slice of strings
-    argv: []const []u8,
-    /// Arena allocator for the separate commands
-    arena: std.heap.ArenaAllocator,
-} {
-    var line_buf: [1 << 13]u8 = undefined;
+pub const Parser = struct {
+    pub const MAX_ARGV = 16;
 
-    // NOTE: 1) Array header:
-    //          "*3\r\n"
-    const header = try readLineCRLF(reader, &line_buf);
-    if (header.len == 0 or header[0] != '*') return error.NotAnArray;
-    const count = try std.fmt.parseInt(usize, header[1..], 10);
+    /// Rolling buffer that survives across reads
+    in_buf: [8192]u8 = undefined,
+    in_used: usize = 0,
 
-    log.debug("Header: {d} commands", .{count});
+    /// `argv` scratch (slices point into `in_buf`)
+    argv: [MAX_ARGV][]const u8 = undefined,
+    argc: usize = 0,
+};
 
-    var arena: std.heap.ArenaAllocator = .init(allocator);
-    errdefer arena.deinit();
-    const a = arena.allocator();
+pub const Err = error{
+    NeedMore,
+    NotArray,
+    BadCRLF,
+    BadLen,
+    BadInt,
+    UnsupportedType,
+};
 
-    // WARN: parent `allocator` owns the list
-    var parts: std.ArrayList([]u8) = try .initCapacity(allocator, count);
-
-    // NOTE: 2) For each element: expect a bulk string:
-    //          "$<len>\r\n<bytes>\r\n"
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        const typeline = try readLineCRLF(reader, &line_buf);
-        if (typeline.len == 0) return error.BadFrame;
-
-        log.debug("Typeline #{d}: {s}", .{ i, typeline });
-
-        switch (typeline[0]) {
-            // Bulk string
-            '$' => {
-                const len = try std.fmt.parseInt(usize, typeline[1..], 10);
-                if (len == 0xffffffffffffffff) return error.BadLength;
-
-                // Read exactly len bytes, then a CRLF
-                // WARN: child `arena` owns the elements
-                const data = try readNBytesAlloc(reader, a, len);
-                try readExactCRLF(reader);
-
-                try parts.append(allocator, data);
-            },
-            else => return error.UnsupportedType,
+fn findCRLF(s: []const u8) ?usize {
+    if (s.len < 2) {
+        return null;
+    }
+    var i: usize = 1;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\n' and s[i - 1] == '\r') {
+            return i - 1;
         }
     }
+    return null;
+}
 
+fn readLineCRLF_mem(buf: []const u8, start: usize) !struct { line: []const u8, next: usize } {
+    const rest = buf[start..];
+    const cr = findCRLF(rest) orelse return Err.NeedMore;
     return .{
-        .argv = try parts.toOwnedSlice(allocator),
-        .arena = arena,
+        .line = rest[0..cr],
+        .next = start + cr + 2,
     };
 }
 
-pub fn writeString(writer: *io.Writer, string: ?[]const u8) !void {
-    if (string) |s| {
-        try writer.print("${d}\r\n{s}\r\n", .{ s.len, s });
-    } else {
-        try writer.print("$-1\r\n", .{});
+/// Try to parse ONE RESP array-of-bulk-strings from parser.in_buf
+/// On success: sets parser.argv/argc and returns bytes_consumed
+/// On partial input: returns error.NeedMore (do not modify the buffer)
+pub fn tryParseOneInPlace(p: *Parser) !usize {
+    const src = p.in_buf[0..p.in_used];
+    if (src.len == 0) {
+        return Err.NeedMore;
     }
 
-    try writer.flush();
+    var pos: usize = 0;
+
+    const header = try readLineCRLF_mem(src, pos);
+    if (header.line.len == 0 or header.line[0] != '*') {
+        return Err.NotArray;
+    }
+    const count = std.fmt.parseInt(usize, header.line[1..], 10) catch return Err.BadInt;
+    if (count > Parser.MAX_ARGV) {
+        return Err.BadLen;
+    }
+    pos = header.next;
+
+    p.argc = 0;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const tl = try readLineCRLF_mem(src, pos);
+        if (tl.line.len == 0 or tl.line[0] != '$') {
+            return Err.UnsupportedType;
+        }
+        const blen = std.fmt.parseInt(usize, tl.line[1..], 10) catch return Err.BadInt;
+        pos = tl.next;
+
+        if (src.len < pos + blen + 2) {
+            return Err.NeedMore;
+        }
+        const body = src[pos .. pos + blen];
+        pos += blen;
+
+        if (src[pos] != '\r' or src[pos + 1] != '\n') {
+            return Err.BadCRLF;
+        }
+        pos += 2;
+
+        p.argv[i] = body;
+        p.argc += 1;
+    }
+    return pos;
+}
+
+/// Slide remaining bytes down after consuming `n`
+pub fn compact(p: *Parser, n: usize) void {
+    if (n == 0) {
+        return;
+    }
+    if (n < p.in_used) {
+        @memmove(p.in_buf[0..], p.in_buf[n..p.in_used]);
+    }
+    p.in_used -= n;
 }
 
 pub const State = struct {
     kv: std.StringArrayHashMapUnmanaged([]u8),
     allocator: std.mem.Allocator,
 };
-
-pub fn handleConnection(reader: *io.Reader, writer: *io.Writer, allocator: std.mem.Allocator, state: *State) !void {
-    while (true) {
-        const cmd = readOneCommand(reader, allocator) catch |err| switch (err) {
-            // NOTE: connection closed (expectedly), exit the per-connection loop
-            error.EndOfStream,
-            => {
-                break;
-            },
-            else => return err,
-        };
-        defer cmd.arena.deinit();
-        defer allocator.free(cmd.argv);
-
-        for (cmd.argv, 0..) |arg, idx| {
-            log.debug("{d}: {s}", .{ idx, arg });
-        }
-
-        if (std.mem.eql(u8, cmd.argv[0], "PING")) {
-            _ = try writer.write("+PONG\r\n");
-            try writer.flush();
-        } else if (std.mem.eql(u8, cmd.argv[0], "ECHO")) {
-            _ = try writeString(writer, cmd.argv[1]);
-        } else if (std.mem.eql(u8, cmd.argv[0], "SET")) {
-            try state.kv.put(state.allocator, cmd.argv[1], cmd.argv[2]);
-            _ = try writeString(writer, "OK");
-        } else if (std.mem.eql(u8, cmd.argv[0], "GET")) {
-            const v = state.kv.get(cmd.argv[1]);
-            _ = try writeString(writer, v);
-        }
-    }
-}
-
-pub fn connectionWorker(conn: Connection, state: *State) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() == .ok);
-    const allocator = gpa.allocator();
-
-    var in_buf: [1 << 12]u8 = undefined;
-    var out_buf: [1 << 12]u8 = undefined;
-
-    defer conn.stream.close();
-
-    var stream_reader = conn.stream.reader(&in_buf);
-    const reader: *io.Reader = stream_reader.interface();
-
-    var stream_writer = conn.stream.writer(&out_buf);
-    const writer: *io.Writer = &stream_writer.interface;
-
-    try handleConnection(reader, writer, allocator, state);
-}
