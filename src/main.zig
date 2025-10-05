@@ -4,6 +4,7 @@ const Resp = @import("./Resp.zig");
 const std = @import("std");
 const net = std.net;
 const io = std.io;
+const posix = std.posix;
 
 const xev = @import("xev");
 
@@ -23,6 +24,8 @@ pub fn main() !void {
     const address: net.Address = .initIp4(.{ 127, 0, 0, 1 }, port);
 
     var server: xev.TCP = try .init(address);
+    // NOTE: set `REUSEPORT` (needed for running consecutive tests)
+    try posix.setsockopt(server.fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
 
     try server.bind(address);
     try server.listen(1);
