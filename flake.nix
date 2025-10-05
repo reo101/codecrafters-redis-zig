@@ -25,6 +25,7 @@
           pkgs.zls
 
           ### Testing
+          (if true then pkgs.valkey else pkgs.redis)
           pkgs.netcat
           pkgs.codecrafters-cli
         ];
