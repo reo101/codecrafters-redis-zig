@@ -47,6 +47,8 @@ pub const Connection = struct {
     loop: *xev.Loop,
     sock: xev.TCP,
     alloc: std.mem.Allocator,
+    // For access to `active` and `closing`
+    ctx: *Ctx,
 
     c_io: xev.Completion = undefined,
 
@@ -181,7 +183,27 @@ pub const Connection = struct {
 
     fn onClosed(self_opt: ?*Connection, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.CloseError!void) xev.CallbackAction {
         var self = self_opt.?;
+        const ctx = self.ctx;
+
+        // NOTE: Destroy the connection object
+        //       (each one keeps a reference to the allocator that allocated it)
         self.alloc.destroy(self);
+
+        // If that was the last connection,
+        // shut the server down and stop the loop
+        ctx.active -= 1;
+        if (ctx.active == 0 and !ctx.closing) {
+            ctx.closing = true;
+            var done = false;
+            ctx.server.close(ctx.loop, &ctx.c_server_close, bool, &done, (struct {
+                fn closedCb(_: ?*bool, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.CloseError!void) xev.CallbackAction {
+                    return .disarm;
+                }
+            }).closedCb);
+            // NOTE: Returns from loop.run(...)
+            // TODO: see comment in `main.zig`
+            // ctx.loop.stop();
+        }
         return .disarm;
     }
 };
@@ -190,10 +212,17 @@ pub const Ctx = struct {
     loop: *xev.Loop,
     allocator: std.mem.Allocator,
     state: *Resp.State,
+    server: *xev.TCP,
+    active: usize = 0,
+    closing: bool = false,
+    c_server_close: xev.Completion = undefined,
 };
 
 pub fn acceptCb(ctx_opt: ?*Ctx, l: *xev.Loop, _: *xev.Completion, r: xev.AcceptError!xev.TCP) xev.CallbackAction {
     const ctx = ctx_opt.?;
+    // NOTE: Don't rearm during shutdown
+    if (ctx.closing) return .disarm;
+
     var sock = r catch |err| {
         log.err("Accept error: {any}", .{err});
         return .rearm;
@@ -201,18 +230,21 @@ pub fn acceptCb(ctx_opt: ?*Ctx, l: *xev.Loop, _: *xev.Completion, r: xev.AcceptE
 
     var conn = ctx.allocator.create(Connection) catch {
         var c: xev.Completion = undefined;
-        sock.close(l, &c, void, null, struct {
+        sock.close(l, &c, void, null, (struct {
             fn cb(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.CloseError!void) xev.CallbackAction {
                 return .disarm;
             }
-        }.cb);
+        }).cb);
         return .rearm;
     };
+    // NOTE: `Rc`-style
+    ctx.active += 1;
     conn.* = .{
         .loop = l,
         .sock = sock,
         .alloc = ctx.allocator,
         .state = ctx.state,
+        .ctx = ctx,
     };
     conn.start();
 

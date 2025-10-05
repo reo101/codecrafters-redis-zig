@@ -46,10 +46,13 @@ pub fn main() !void {
         // TODO: replace with an arena
         .allocator = std.heap.c_allocator,
         .state = &state,
+        .server = &server,
     };
 
     // NOTE: `accept` rearms itself after accepting a connection
     server.accept(&loop, &c_accept, Server.Ctx, &ctx, Server.acceptCb);
 
+    // TODO: CLI argument to keep going even after last client disconnects
+    //       (acceptor stops `.rearm`-ing if there are no other active ones)
     try loop.run(.until_done);
 }
