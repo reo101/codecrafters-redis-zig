@@ -104,12 +104,22 @@ pub fn readOneCommand(reader: *io.Reader, allocator: std.mem.Allocator) !struct 
     };
 }
 
-pub fn writeString(writer: *io.Writer, string: []const u8) !void {
-    try writer.print("${d}\r\n{s}\r\n", .{ string.len, string });
+pub fn writeString(writer: *io.Writer, string: ?[]const u8) !void {
+    if (string) |s| {
+        try writer.print("${d}\r\n{s}\r\n", .{ s.len, s });
+    } else {
+        try writer.print("$-1\r\n", .{});
+    }
+
     try writer.flush();
 }
 
-pub fn handleConnection(reader: *io.Reader, writer: *io.Writer, allocator: std.mem.Allocator) !void {
+pub const State = struct {
+    kv: std.StringArrayHashMapUnmanaged([]u8),
+    allocator: std.mem.Allocator,
+};
+
+pub fn handleConnection(reader: *io.Reader, writer: *io.Writer, allocator: std.mem.Allocator, state: *State) !void {
     while (true) {
         const cmd = readOneCommand(reader, allocator) catch |err| switch (err) {
             // NOTE: connection closed (expectedly), exit the per-connection loop
@@ -131,11 +141,17 @@ pub fn handleConnection(reader: *io.Reader, writer: *io.Writer, allocator: std.m
             try writer.flush();
         } else if (std.mem.eql(u8, cmd.argv[0], "ECHO")) {
             _ = try writeString(writer, cmd.argv[1]);
+        } else if (std.mem.eql(u8, cmd.argv[0], "SET")) {
+            try state.kv.put(state.allocator, cmd.argv[1], cmd.argv[2]);
+            _ = try writeString(writer, "OK");
+        } else if (std.mem.eql(u8, cmd.argv[0], "GET")) {
+            const v = state.kv.get(cmd.argv[1]);
+            _ = try writeString(writer, v);
         }
     }
 }
 
-pub fn connectionWorker(conn: Connection) !void {
+pub fn connectionWorker(conn: Connection, state: *State) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();
@@ -151,5 +167,5 @@ pub fn connectionWorker(conn: Connection) !void {
     var stream_writer = conn.stream.writer(&out_buf);
     const writer: *io.Writer = &stream_writer.interface;
 
-    try handleConnection(reader, writer, allocator);
+    try handleConnection(reader, writer, allocator, state);
 }
